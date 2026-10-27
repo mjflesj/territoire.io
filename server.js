@@ -291,6 +291,12 @@ return {
   id: roomId, clients, tick, humans,
   info: () => ({ id: roomId, humans: humans(), total: players.size }),
   watch(ws) { clients.add(ws); ws.send(JSON.stringify(fullState())); },
+  // Retour à l'accueil en pleine partie : le joueur disparaît, le socket reste spectateur
+  quit(ws) {
+    const p = players.get(ws.playerId);
+    if (p) { p.ws = null; kill(p, null, 'left'); removeDead(p); }
+    ws.playerId = null;
+  },
   leave(ws) {
     clients.delete(ws);
     const p = players.get(ws.playerId);
@@ -352,6 +358,8 @@ wss.on('connection', ws => {
     } else if (m.t === 'dir' && ws.room) {
       const d = m.d | 0;
       if (d >= 0 && d < 4) ws.room.input(ws, d, +m.k || 0, +m.s || 0);
+    } else if (m.t === 'quit' && ws.room) {
+      ws.room.quit(ws);
     } else if (m.t === 'ping') {
       ws.send(JSON.stringify({ t: 'pong', c: m.c }));
     }
