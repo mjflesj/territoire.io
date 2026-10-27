@@ -5,10 +5,12 @@ const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const W = 120, H = 120;           // taille de la carte en cases
-const TICK_MS = 110;              // ~9 cases / seconde
+const W = 150, H = 150;           // taille de la carte en cases
+const TICK_MS = 80;               // 12,5 cases / seconde (petit tick = virages réactifs)
 const MIN_PLAYERS = process.env.BOTS !== undefined ? +process.env.BOTS : 8; // complété par des bots
-const SPAWN_R = 2;                // territoire de départ : carré 5x5
+const MAX_HUMANS = 12;            // joueurs humains max par salle
+const ROOM_COUNT = 8;
+const SPAWN_R = 3;                // territoire de départ : carré 7x7
 
 const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0]; // haut, droite, bas, gauche
 const COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c', '#e84393', '#34495e',
@@ -16,20 +18,23 @@ const COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'
 const BOT_NAMES = ['Pixel', 'Zigzag', 'Carré', 'Ninja', 'Turbo', 'Biscotte', 'Rapido', 'Cookie',
   'Patate', 'Fusée', 'Chamallow', 'Bolide', 'Taupe', 'Gribouille', 'Comète', 'Nugget'];
 
+const idx = (x, y) => y * W + x;
+const inBounds = (x, y) => x >= 0 && y >= 0 && x < W && y < H;
+let nextId = 1;
+
+// Chaque salle est une partie indépendante avec sa propre carte
+function createRoom(roomId) {
 const owner = new Int32Array(W * H);  // id du propriétaire (0 = libre)
 const trail = new Int32Array(W * H);  // id du joueur dont la traînée passe ici
 const players = new Map();            // id -> joueur
-let nextId = 1;
+const clients = new Set();            // sockets qui regardent ou jouent dans cette salle
 let changed = new Set();              // cases dont le propriétaire a changé ce tick
 let events = [];                      // événements du tick (nouveau joueur, mort)
-
-const idx = (x, y) => y * W + x;
-const inBounds = (x, y) => x >= 0 && y >= 0 && x < W && y < H;
 
 function setOwner(i, id) {
   const old = owner[i];
   if (old === id) return;
-  if (old) { const p = players.get(old); if (p) p.area--; }
+  if (old) { const p = players.get(old); if (p) { p.area--; p.lostTo = id; } }
   if (id) { const p = players.get(id); if (p) p.area++; }
   owner[i] = id;
   changed.add(i);
@@ -42,10 +47,11 @@ function pickColor() {
   return list[Math.floor(Math.random() * list.length)];
 }
 
+const SPAWN_MARGIN = 12; // loin des bords pour ne pas mourir contre le mur dès l'apparition
 function findSpawn() {
+  const rnd = n => SPAWN_MARGIN + Math.floor(Math.random() * (n - 2 * SPAWN_MARGIN));
   for (let tries = 0; tries < 300; tries++) {
-    const x = SPAWN_R + 2 + Math.floor(Math.random() * (W - 2 * SPAWN_R - 4));
-    const y = SPAWN_R + 2 + Math.floor(Math.random() * (H - 2 * SPAWN_R - 4));
+    const x = rnd(W), y = rnd(H);
     let ok = true;
     for (let dy = -SPAWN_R - 1; dy <= SPAWN_R + 1 && ok; dy++)
       for (let dx = -SPAWN_R - 1; dx <= SPAWN_R + 1 && ok; dx++) {
@@ -55,14 +61,15 @@ function findSpawn() {
     for (const p of players.values()) if (Math.abs(p.x - x) + Math.abs(p.y - y) < 8) ok = false;
     if (ok) return { x, y };
   }
-  return { x: SPAWN_R + 2 + Math.floor(Math.random() * (W - 2 * SPAWN_R - 4)),
-           y: SPAWN_R + 2 + Math.floor(Math.random() * (H - 2 * SPAWN_R - 4)) };
+  return { x: rnd(W), y: rnd(H) };
 }
 
 function spawn(name, bot) {
   const id = nextId++;
   const { x, y } = findSpawn();
-  const p = { id, name, bot, color: pickColor(), x, y, dir: Math.floor(Math.random() * 4),
+  // Départ orienté vers le centre de la carte
+  const dir = Math.abs(x - W / 2) > Math.abs(y - H / 2) ? (x < W / 2 ? 1 : 3) : (y < H / 2 ? 2 : 0);
+  const p = { id, name, bot, color: pickColor(), x, y, dir,
     queue: [], trail: [], area: 0, kills: 0, alive: true, ws: null };
   players.set(id, p);
   for (let dy = -SPAWN_R; dy <= SPAWN_R; dy++)
@@ -75,10 +82,13 @@ function spawn(name, bot) {
   return p;
 }
 
-function kill(p, by) {
+// reason : 'wall' (bord), 'self' (propre traînée), 'trail' (traînée coupée), 'head' (choc frontal),
+// 'land' (tout le territoire capturé), 'left' (déconnexion)
+function kill(p, by, reason) {
   if (!p.alive) return;
   p.alive = false;
   p.killedBy = by;
+  p.reason = reason;
   if (by && by !== p.id) { const k = players.get(by); if (k) k.kills++; }
 }
 
@@ -86,9 +96,10 @@ function removeDead(p) {
   for (const i of p.trail) if (trail[i] === p.id) trail[i] = 0;
   for (let i = 0; i < owner.length; i++) if (owner[i] === p.id) owner[i] = 0;
   const killer = players.get(p.killedBy);
-  events.push({ k: 'd', id: p.id, by: p.killedBy && p.killedBy !== p.id ? (killer ? killer.name : '?') : null });
+  const by = p.killedBy && p.killedBy !== p.id ? (killer ? killer.name : '?') : null;
+  events.push({ k: 'd', id: p.id, by, r: p.reason });
   if (p.ws && p.ws.readyState === 1) {
-    p.ws.send(JSON.stringify({ t: 'dead', by: events[events.length - 1].by,
+    p.ws.send(JSON.stringify({ t: 'dead', by, reason: p.reason,
       score: +(Math.max(p.maxArea || 0, p.area) * 100 / (W * H)).toFixed(2), kills: p.kills }));
   }
   if (p.ws) p.ws.playerId = null;
@@ -183,18 +194,19 @@ function balanceBots() {
   const humans = [...players.values()].filter(p => !p.bot).length;
   const bots = [...players.values()].filter(p => p.bot);
   const wanted = Math.max(0, MIN_PLAYERS - humans);
+  // Les bots en trop ne sont pas supprimés (ça ressemblait à une mort sans raison) :
+  // ils ne réapparaissent simplement pas après leur prochaine mort.
   if (bots.length < wanted && Math.random() < 0.2) {
     const used = new Set([...players.values()].map(p => p.name));
     const names = BOT_NAMES.filter(n => !used.has(n));
     spawn(names[Math.floor(Math.random() * names.length)] || 'Bot', true);
-  } else if (bots.length > wanted) {
-    kill(bots[0], null);
-    removeDead(bots[0]);
   }
 }
 
 // --- Boucle de jeu ---
 function tick() {
+  // Salle sans personne : on la met en pause
+  if (!clients.size && ![...players.values()].some(p => !p.bot)) return;
   balanceBots();
   const alive = [...players.values()].filter(p => p.alive);
   for (const p of alive) {
@@ -207,17 +219,17 @@ function tick() {
   }
   // Collisions
   for (const p of alive) {
-    if (!inBounds(p.x, p.y)) { kill(p, p.id); continue; }
+    if (!inBounds(p.x, p.y)) { kill(p, p.id, 'wall'); continue; }
     const t = trail[idx(p.x, p.y)];
-    if (t) kill(players.get(t), p.id);
+    if (t) kill(players.get(t), p.id, t === p.id ? 'self' : 'trail');
   }
   for (let a = 0; a < alive.length; a++) for (let b = a + 1; b < alive.length; b++) {
     const p = alive[a], q = alive[b];
     if (p.x !== q.x || p.y !== q.y || !inBounds(p.x, p.y)) continue;
     const o = owner[idx(p.x, p.y)];
-    if (o === p.id) kill(q, p.id);
-    else if (o === q.id) kill(p, q.id);
-    else { kill(p, q.id); kill(q, p.id); }
+    if (o === p.id) kill(q, p.id, 'head');
+    else if (o === q.id) kill(p, q.id, 'head');
+    else { kill(p, q.id, 'head'); kill(q, p.id, 'head'); }
   }
   for (const p of alive) if (!p.alive) removeDead(p);
   // Déplacements : traînée ou capture
@@ -227,7 +239,7 @@ function tick() {
     if (owner[i] === p.id) { if (p.trail.length) capture(p); }
     else { trail[i] = p.id; p.trail.push(i); }
   }
-  for (const p of [...players.values()]) if (p.alive && p.area <= 0) { kill(p, p.killedBy || p.id); removeDead(p); }
+  for (const p of [...players.values()]) if (p.alive && p.area <= 0) { kill(p, p.lostTo || p.id, 'land'); removeDead(p); }
   for (const p of players.values()) p.maxArea = Math.max(p.maxArea || 0, p.area);
   broadcast();
 }
@@ -251,7 +263,7 @@ function broadcast() {
   const msg = JSON.stringify({ t: 's', e: events, c: encodeChanges(),
     p: [...players.values()].map(playerState) });
   changed = new Set(); events = [];
-  for (const ws of wss.clients) if (ws.readyState === 1 && ws.ready) ws.send(msg);
+  for (const ws of clients) if (ws.readyState === 1) ws.send(msg);
 }
 
 function fullState() {
@@ -261,9 +273,42 @@ function fullState() {
     while (i + len < owner.length && owner[i + len] === owner[i]) len++;
     grid.push(owner[i], len); i += len;
   }
-  return { t: 'init', w: W, h: H, tick: TICK_MS, grid,
+  return { t: 'init', room: roomId, w: W, h: H, tick: TICK_MS, grid,
     players: [...players.values()].map(p => ({ id: p.id, name: p.name, color: p.color, s: playerState(p), trail: p.trail })) };
 }
+
+function humans() { return [...players.values()].filter(p => !p.bot).length; }
+
+return {
+  id: roomId, clients, tick, humans,
+  info: () => ({ id: roomId, humans: humans(), total: players.size }),
+  watch(ws) { clients.add(ws); ws.send(JSON.stringify(fullState())); },
+  leave(ws) {
+    clients.delete(ws);
+    const p = players.get(ws.playerId);
+    if (p) { p.ws = null; kill(p, null, 'left'); removeDead(p); }
+    ws.playerId = null;
+  },
+  join(ws, name) {
+    if (humans() >= MAX_HUMANS) return false;
+    const p = spawn(name, false);
+    p.ws = ws; ws.playerId = p.id;
+    ws.send(JSON.stringify({ t: 'you', id: p.id, x: p.x, y: p.y, dir: p.dir }));
+    return true;
+  },
+  input(ws, d) {
+    const p = players.get(ws.playerId);
+    if (!p || !p.alive) return;
+    // Pas de doublons, et un nouvel ordre remplace le dernier si la file est pleine
+    // (sinon un appui long remplissait la file et le virage suivant était perdu)
+    if (p.queue[p.queue.length - 1] === d) return;
+    if (p.queue.length >= 2) p.queue[1] = d; else p.queue.push(d);
+  },
+};
+}
+
+const rooms = Array.from({ length: ROOM_COUNT }, (_, i) => createRoom(i));
+const roomList = () => ({ t: 'rooms', max: MAX_HUMANS, rooms: rooms.map(r => r.info()) });
 
 // --- Serveur HTTP + WebSocket ---
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
@@ -279,27 +324,34 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server });
+function watch(ws, r) {
+  const room = rooms[r] || rooms[0];
+  if (ws.room === room) return;
+  if (ws.room) ws.room.leave(ws);
+  ws.room = room;
+  room.watch(ws);
+}
 wss.on('connection', ws => {
-  // Envoyé au tick suivant pour inclure les changements en attente
-  setImmediate(() => { ws.send(JSON.stringify(fullState())); ws.ready = true; });
+  ws.send(JSON.stringify(roomList()));
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.t === 'join' && !ws.playerId) {
+    if (m.t === 'watch') {
+      if (!ws.playerId) watch(ws, m.r | 0);
+    } else if (m.t === 'join' && !ws.playerId) {
+      watch(ws, m.r | 0);
       const name = String(m.name || '').replace(/[<>]/g, '').trim().slice(0, 16) || 'Anonyme';
-      const p = spawn(name, false);
-      p.ws = ws; ws.playerId = p.id;
-      ws.send(JSON.stringify({ t: 'you', id: p.id }));
-    } else if (m.t === 'dir' && ws.playerId) {
-      const p = players.get(ws.playerId);
+      if (!ws.room.join(ws, name)) ws.send(JSON.stringify({ t: 'full' }));
+    } else if (m.t === 'dir' && ws.room) {
       const d = m.d | 0;
-      if (p && d >= 0 && d < 4 && p.queue.length < 3) p.queue.push(d);
+      if (d >= 0 && d < 4) ws.room.input(ws, d);
     }
   });
-  ws.on('close', () => {
-    const p = players.get(ws.playerId);
-    if (p) { p.ws = null; kill(p, null); removeDead(p); }
-  });
+  ws.on('close', () => { if (ws.room) ws.room.leave(ws); });
 });
 
-setInterval(tick, TICK_MS);
+setInterval(() => { for (const r of rooms) r.tick(); }, TICK_MS);
+setInterval(() => {
+  const msg = JSON.stringify(roomList());
+  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(msg);
+}, 2000);
 server.listen(PORT, () => console.log(`Serveur lancé sur http://localhost:${PORT}`));

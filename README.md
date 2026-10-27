@@ -11,6 +11,8 @@ npm start
 
 Puis ouvrir http://localhost:3000 (plusieurs onglets ou appareils du même réseau pour tester le multijoueur).
 
+L'accueil propose 8 salles indépendantes (12 joueurs humains max chacune, complétées par des bots). Une salle sans joueur ni spectateur est mise en pause.
+
 ## Règles
 
 - Sors de ton territoire pour laisser une traînée, reviens dedans pour capturer toute la zone entourée.
@@ -23,9 +25,9 @@ Puis ouvrir http://localhost:3000 (plusieurs onglets ou appareils du même rése
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `PORT` | `3000` | Port HTTP/WebSocket |
-| `BOTS` | `8` | Nombre minimum de joueurs ; des bots complètent la partie et laissent leur place aux humains |
+| `BOTS` | `8` | Nombre minimum de joueurs par salle ; des bots complètent la partie et laissent leur place aux humains |
 
-Taille de carte et vitesse : constantes `W`, `H` et `TICK_MS` en haut de `server.js`.
+Taille de carte, vitesse, nombre de salles et joueurs max : constantes `W`, `H`, `TICK_MS`, `ROOM_COUNT` et `MAX_HUMANS` en haut de `server.js`.
 
 ## Mettre en ligne
 
