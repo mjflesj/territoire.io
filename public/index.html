@@ -101,7 +101,10 @@ function syncClock(n) {
   if (!clock.ok || Math.abs(e) > 3) { clock.base += e; clock.ok = true; }
   else clock.base += e * 0.05;
 }
-let rooms = [], maxHumans = 12, room = 0, predQ = [];
+let rooms = [], maxHumans = 12, room = 0;
+// Notre joueur est affiché en avance sur le serveur (lead, en ticks ≈ aller-retour réseau) ;
+// pend = virages envoyés que le serveur n'a pas encore renvoyés, chacun prévu pour le tick k.
+let pend = [], seq = 0, rtt = 0, lead = 1, leadTarget = 1;
 try { room = Math.min(7, Math.max(0, +localStorage.getItem('room') || 0)); } catch {}
 
 function shade(hex, f) {
@@ -126,16 +129,12 @@ function removePlayer(id) {
   miniDirty = true;
 }
 function applyState(p, s) {
-  const [, x, y, dir, tl, area, kills] = s;
+  const [, x, y, dir, tl, area, kills, ack] = s;
+  if (p.id === me) pend = pend.filter(i => i.s > ack); // virages traités par le serveur
   if (p.fresh) { p.px = x; p.py = y; p.fresh = false; } else { p.px = p.x; p.py = p.y; }
   p.x = x; p.y = y; p.dir = dir; p.area = area; p.kills = kills;
   if (tl === 0) p.trail = [];
   else if (tl > p.trail.length) p.trail.push(y * W + x);
-  // Prédiction : on retire les virages déjà appliqués par le serveur (ou devenus impossibles / trop vieux)
-  if (p.id === me) {
-    const now = performance.now();
-    while (predQ.length && (predQ[0].d === dir || (predQ[0].d + 2) % 4 === dir || now - predQ[0].t > 350)) predQ.shift();
-  }
 }
 
 // --- Réseau ---
@@ -143,7 +142,7 @@ function connect() {
   status('Connexion…');
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
   ws.onmessage = ev => handle(JSON.parse(ev.data));
-  ws.onopen = () => { status(null); send({ t: 'watch', r: room }); };
+  ws.onopen = () => { status(null); send({ t: 'watch', r: room }); send({ t: 'ping', c: performance.now() }); };
   ws.onclose = () => {
     status('Connexion perdue, reconnexion…');
     me = null; grid = null; showDeath(false); show('menu', true);
@@ -158,7 +157,7 @@ function handle(m) {
   } else if (m.t === 'full') {
     show('menu', true); document.getElementById('menuMsg').textContent = 'Cette salle est pleine, choisis-en une autre.';
   } else if (m.t === 'init') {
-    room = m.room; predQ = []; renderRooms();
+    room = m.room; pend = []; renderRooms();
     document.getElementById('boardTitle').textContent = `Salle ${room + 1} · Classement`;
     W = m.w; H = m.h; TICK = m.tick; lastN = m.n; clock.ok = false; syncClock(m.n); grid = new Int32Array(W * H); players = new Map();
     let i = 0;
@@ -188,7 +187,11 @@ function handle(m) {
     lastN = m.n; syncClock(m.n);
     updateBoard();
   } else if (m.t === 'you') {
-    me = m.id; predQ = [];
+    me = m.id; pend = [];
+  } else if (m.t === 'pong') {
+    const s = performance.now() - m.c;
+    rtt = rtt ? rtt * 0.8 + s * 0.2 : s;
+    leadTarget = Math.min(8, rtt / TICK + 0.6);
   } else if (m.t === 'dead') {
     me = null;
     document.getElementById('deathTitle').textContent = 'Éliminé !';
@@ -265,10 +268,14 @@ const KEYS = { ArrowUp: 0, KeyW: 0, KeyZ: 0, ArrowRight: 1, KeyD: 1, ArrowDown: 
 function turn(d) {
   const p = players.get(me);
   if (!p) return;
-  const cur = predQ.length ? predQ[predQ.length - 1].d : p.dir;
-  if (d === cur || (d + 2) % 4 === cur) return;
-  if (predQ.length >= 2) predQ[1] = { d, t: performance.now() }; else predQ.push({ d, t: performance.now() });
-  send({ t: 'dir', d });
+  const last = pend[pend.length - 1];
+  const cur = last ? last.d : p.dir;
+  if (d === cur || (d + 2) % 4 === cur || pend.length >= 4) return;
+  // Le virage se fera au centre de la prochaine case : pas de saut à l'écran
+  let k = Math.floor(clockNow(performance.now()) + lead) + 2;
+  if (last && k <= last.k) k = last.k + 1;
+  pend.push({ d, k, s: ++seq });
+  send({ t: 'dir', d, k, s: seq });
 }
 addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
@@ -318,6 +325,7 @@ function frame(now) {
   if (!grid) return;
   const T = clockNow(now), f = Math.max(-1, Math.min(2, T - lastN));
   const dt = Math.min(100, now - (lastFrame || now)); lastFrame = now;
+  lead += (leadTarget - lead) * Math.min(1, dt / 1000);
   const vw = innerWidth, vh = innerHeight;
   // Extrapolation : chaque tête avance vers sa prochaine case (au lieu d'afficher le passé),
   // et notre joueur suit immédiatement le virage demandé.
@@ -325,17 +333,33 @@ function frame(now) {
   // correction du serveur) sont absorbés par un décalage qui s'amortit en ~80 ms au lieu de secouer l'écran.
   const decay = Math.exp(-dt / 80);
   for (const p of players.values()) {
-    const d = f > 0 && p.id === me && predQ.length ? predQ[0].d : p.dir;
-    const rx = p.x + DX[d] * f, ry = p.y + DY[d] * f;
+    let d = p.dir, rx = p.x + DX[d] * f, ry = p.y + DY[d] * f, t = T;
+    p.path = null;
+    if (p.id === me) {
+      // Simulation locale à l'instant S = T + lead en rejouant les virages en attente
+      const S = T + lead, end = Math.floor(S);
+      let x = p.x, y = p.y, prevK = lastN;
+      // Un virage arrivé en retard sera appliqué par le serveur au plus tôt au prochain tick
+      for (const i of pend) { i.ek = Math.max(i.k, prevK + 1); prevK = i.ek; }
+      p.path = [];
+      for (let n = lastN + 1; n <= end && n <= lastN + 10; n++) {
+        for (const i of pend) if (i.ek === n && i.d !== d && (i.d + 2) % 4 !== d) d = i.d;
+        x += DX[d]; y += DY[d];
+        if (x >= 0 && y >= 0 && x < W && y < H) p.path.push(y * W + x);
+      }
+      for (const i of pend) if (i.ek === end + 1 && i.d !== d && (i.d + 2) % 4 !== d) d = i.d;
+      const fr = Math.min(1, S - end);
+      rx = x + DX[d] * fr; ry = y + DY[d] * fr; t = S;
+    }
     if (p.rx === undefined) { p.ox = p.oy = 0; }
     else {
-      const ex = p.rx + DX[p.rd] * (T - p.rT) * p.rv, ey = p.ry + DY[p.rd] * (T - p.rT) * p.rv;
+      const ex = p.rx + DX[p.rd] * (t - p.rT) * p.rv, ey = p.ry + DY[p.rd] * (t - p.rT) * p.rv;
       const jx = ex - rx, jy = ey - ry;
       if (Math.abs(jx) + Math.abs(jy) > 3) { p.ox = p.oy = 0; }
       else { p.ox = p.ox * decay + jx; p.oy = p.oy * decay + jy; }
     }
     // Bloquée (message en retard) : la position brute ne bouge plus, il ne faut pas l'extrapoler
-    p.rx = rx; p.ry = ry; p.rd = d; p.rT = T; p.rv = f > -1 && f < 2 ? 1 : 0;
+    p.rx = rx; p.ry = ry; p.rd = d; p.rT = t; p.rv = f > -1 && f < 2 ? 1 : 0;
     p.hx = rx + p.ox; p.hy = ry + p.oy;
   }
   const pos = p => ({ x: p.hx, y: p.hy });
@@ -382,15 +406,24 @@ function frame(now) {
   // Traînées
   ctx.lineCap = 'square'; ctx.lineJoin = 'miter';
   for (const p of players.values()) {
-    if (!p.trail.length) continue;
+    // Pour notre joueur : traînée du serveur + cases prédites hors de notre territoire
+    let cells = p.trail;
+    if (p.path) {
+      cells = p.trail.slice();
+      for (const c of p.path) {
+        if (grid[c] === me) { if (cells.length) break; continue; }
+        cells.push(c);
+      }
+    }
+    if (!cells.length) continue;
     const h = pos(p);
     ctx.strokeStyle = p.trailCol; ctx.lineWidth = cs * 0.62; ctx.beginPath();
-    const f = p.trail[0];
+    const f = cells[0];
     const fx = f % W, fy = (f - fx) / W;
-    ctx.moveTo(ox + (fx + 0.5 - DX[p.trail.length === 1 ? p.dir : dirBetween(p.trail[0], p.trail[1])] * 0.5) * cs,
-               oy + (fy + 0.5 - DY[p.trail.length === 1 ? p.dir : dirBetween(p.trail[0], p.trail[1])] * 0.5) * cs);
-    for (let k = 0; k < p.trail.length; k++) {
-      const c = p.trail[k], cx = c % W, cy = (c - cx) / W;
+    const d0 = cells.length === 1 ? p.rd : dirBetween(cells[0], cells[1]);
+    ctx.moveTo(ox + (fx + 0.5 - DX[d0] * 0.5) * cs, oy + (fy + 0.5 - DY[d0] * 0.5) * cs);
+    for (let k = 0; k < cells.length; k++) {
+      const c = cells[k], cx = c % W, cy = (c - cx) / W;
       ctx.lineTo(ox + (cx + 0.5) * cs, oy + (cy + 0.5) * cs);
     }
     ctx.lineTo(ox + (h.x + 0.5) * cs, oy + (h.y + 0.5) * cs);
@@ -432,6 +465,7 @@ function roundRect(x, y, w, h, r) {
 }
 
 connect();
+setInterval(() => send({ t: 'ping', c: performance.now() }), 2000);
 requestAnimationFrame(frame);
 </script>
 </body>

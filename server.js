@@ -71,7 +71,7 @@ function spawn(name, bot) {
   // Départ orienté vers le centre de la carte
   const dir = Math.abs(x - W / 2) > Math.abs(y - H / 2) ? (x < W / 2 ? 1 : 3) : (y < H / 2 ? 2 : 0);
   const p = { id, name, bot, color: pickColor(), x, y, dir,
-    queue: [], trail: [], area: 0, kills: 0, alive: true, ws: null };
+    queue: [], sched: [], ack: 0, trail: [], area: 0, kills: 0, alive: true, ws: null };
   players.set(id, p);
   for (let dy = -SPAWN_R; dy <= SPAWN_R; dy++)
     for (let dx = -SPAWN_R; dx <= SPAWN_R; dx++) {
@@ -212,6 +212,13 @@ function tick() {
   const alive = [...players.values()].filter(p => p.alive);
   for (const p of alive) {
     if (p.bot) botThink(p);
+    // Virages des humains : chacun est prévu pour un tick précis (calculé par le client, qui joue
+    // un peu en avance) afin que le serveur tourne exactement sur la même case que l'écran.
+    while (p.sched.length && p.sched[0].k <= tickNo) {
+      const { d, s } = p.sched.shift();
+      p.ack = s; // dernier virage traité, renvoyé au client
+      if (d !== p.dir && (d + 2) % 4 !== p.dir) { p.dir = d; break; }
+    }
     while (p.queue.length) {
       const d = p.queue.shift();
       if (d !== p.dir && (d + 2) % 4 !== p.dir) { p.dir = d; break; }
@@ -258,7 +265,7 @@ function encodeChanges() {
   return out;
 }
 
-function playerState(p) { return [p.id, p.x, p.y, p.dir, p.trail.length, p.area, p.kills]; }
+function playerState(p) { return [p.id, p.x, p.y, p.dir, p.trail.length, p.area, p.kills, p.ack]; }
 
 function broadcast() {
   const msg = JSON.stringify({ t: 's', n: tickNo, e: events, c: encodeChanges(),
@@ -297,13 +304,13 @@ return {
     ws.send(JSON.stringify({ t: 'you', id: p.id, x: p.x, y: p.y, dir: p.dir }));
     return true;
   },
-  input(ws, d) {
+  input(ws, d, k, s) {
     const p = players.get(ws.playerId);
-    if (!p || !p.alive) return;
-    // Pas de doublons, et un nouvel ordre remplace le dernier si la file est pleine
-    // (sinon un appui long remplissait la file et le virage suivant était perdu)
-    if (p.queue[p.queue.length - 1] === d) return;
-    if (p.queue.length >= 2) p.queue[1] = d; else p.queue.push(d);
+    if (!p || !p.alive || p.sched.length >= 4) return;
+    if (!(k > tickNo && k < tickNo + 40)) k = tickNo + 1; // en retard ou invalide : au prochain tick
+    const last = p.sched[p.sched.length - 1];
+    if (last && k <= last.k) k = last.k + 1;
+    p.sched.push({ d, k, s });
   },
 };
 }
@@ -344,7 +351,9 @@ wss.on('connection', ws => {
       if (!ws.room.join(ws, name)) ws.send(JSON.stringify({ t: 'full' }));
     } else if (m.t === 'dir' && ws.room) {
       const d = m.d | 0;
-      if (d >= 0 && d < 4) ws.room.input(ws, d);
+      if (d >= 0 && d < 4) ws.room.input(ws, d, +m.k || 0, +m.s || 0);
+    } else if (m.t === 'ping') {
+      ws.send(JSON.stringify({ t: 'pong', c: m.c }));
     }
   });
   ws.on('close', () => { if (ws.room) ws.room.leave(ws); });
