@@ -21,6 +21,7 @@ const BOT_NAMES = ['Pixel', 'Zigzag', 'Carré', 'Ninja', 'Turbo', 'Biscotte', 'R
 const idx = (x, y) => y * W + x;
 const inBounds = (x, y) => x >= 0 && y >= 0 && x < W && y < H;
 let nextId = 1;
+let tickNo = 0; // numéro du tick, sert au client à garder une horloge régulière
 
 // Chaque salle est une partie indépendante avec sa propre carte
 function createRoom(roomId) {
@@ -260,7 +261,7 @@ function encodeChanges() {
 function playerState(p) { return [p.id, p.x, p.y, p.dir, p.trail.length, p.area, p.kills]; }
 
 function broadcast() {
-  const msg = JSON.stringify({ t: 's', e: events, c: encodeChanges(),
+  const msg = JSON.stringify({ t: 's', n: tickNo, e: events, c: encodeChanges(),
     p: [...players.values()].map(playerState) });
   changed = new Set(); events = [];
   for (const ws of clients) if (ws.readyState === 1) ws.send(msg);
@@ -273,7 +274,7 @@ function fullState() {
     while (i + len < owner.length && owner[i + len] === owner[i]) len++;
     grid.push(owner[i], len); i += len;
   }
-  return { t: 'init', room: roomId, w: W, h: H, tick: TICK_MS, grid,
+  return { t: 'init', room: roomId, n: tickNo, w: W, h: H, tick: TICK_MS, grid,
     players: [...players.values()].map(p => ({ id: p.id, name: p.name, color: p.color, s: playerState(p), trail: p.trail })) };
 }
 
@@ -349,7 +350,15 @@ wss.on('connection', ws => {
   ws.on('close', () => { if (ws.room) ws.room.leave(ws); });
 });
 
-setInterval(() => { for (const r of rooms) r.tick(); }, TICK_MS);
+// Boucle à pas fixe sans dérive (setInterval prend du retard et rend les ticks irréguliers)
+let nextTick = Date.now();
+(function loop() {
+  tickNo++;
+  for (const r of rooms) r.tick();
+  nextTick += TICK_MS;
+  if (Date.now() - nextTick > 1000) nextTick = Date.now(); // gros retard : on repart sans rattraper
+  setTimeout(loop, Math.max(0, nextTick - Date.now()));
+})();
 setInterval(() => {
   const msg = JSON.stringify(roomList());
   for (const ws of wss.clients) if (ws.readyState === 1) ws.send(msg);

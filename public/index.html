@@ -92,7 +92,15 @@ const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
 const cvs = document.getElementById('game'), ctx = cvs.getContext('2d');
 const mini = document.getElementById('mini'), mctx = mini.getContext('2d');
 let W = 0, H = 0, TICK = 110, grid = null, players = new Map(), me = null, ws = null;
-let lastTick = performance.now(), miniDirty = true, cam = { x: 0, y: 0 }, cs = 24;
+let lastFrame = 0, lastN = 0, miniDirty = true, cam = { x: 0, y: 0 }, cs = 24;
+// Horloge lissée : estime le tick serveur courant sans dépendre de l'heure d'arrivée de chaque message
+const clock = { base: 0, ok: false };
+const clockNow = now => clock.base + now / TICK;
+function syncClock(n) {
+  const e = n - clockNow(performance.now());
+  if (!clock.ok || Math.abs(e) > 3) { clock.base += e; clock.ok = true; }
+  else clock.base += e * 0.05;
+}
 let rooms = [], maxHumans = 12, room = 0, predQ = [];
 try { room = Math.min(7, Math.max(0, +localStorage.getItem('room') || 0)); } catch {}
 
@@ -152,7 +160,7 @@ function handle(m) {
   } else if (m.t === 'init') {
     room = m.room; predQ = []; renderRooms();
     document.getElementById('boardTitle').textContent = `Salle ${room + 1} · Classement`;
-    W = m.w; H = m.h; TICK = m.tick; grid = new Int32Array(W * H); players = new Map();
+    W = m.w; H = m.h; TICK = m.tick; lastN = m.n; clock.ok = false; syncClock(m.n); grid = new Int32Array(W * H); players = new Map();
     let i = 0;
     for (let k = 0; k < m.grid.length; k += 2) { grid.fill(m.grid[k], i, i + m.grid[k + 1]); i += m.grid[k + 1]; }
     for (const pd of m.players) { const p = addPlayer(pd.id, pd.name, pd.color); applyState(p, pd.s); p.trail = pd.trail.slice(); }
@@ -177,7 +185,7 @@ function handle(m) {
       applyState(players.get(s[0]) || addPlayer(s[0], '?', '#888'), s);
     }
     for (const id of [...players.keys()]) if (!seen.has(id)) players.delete(id);
-    lastTick = performance.now();
+    lastN = m.n; syncClock(m.n);
     updateBoard();
   } else if (m.t === 'you') {
     me = m.id; predQ = [];
@@ -308,19 +316,35 @@ let lastMini = 0;
 function frame(now) {
   requestAnimationFrame(frame);
   if (!grid) return;
-  const a = Math.min(1, (now - lastTick) / TICK);
+  const T = clockNow(now), f = Math.max(-1, Math.min(2, T - lastN));
+  const dt = Math.min(100, now - (lastFrame || now)); lastFrame = now;
   const vw = innerWidth, vh = innerHeight;
   // Extrapolation : chaque tête avance vers sa prochaine case (au lieu d'afficher le passé),
   // et notre joueur suit immédiatement le virage demandé.
-  const pos = p => {
-    const d = p.id === me && predQ.length ? predQ[0].d : p.dir;
-    return { x: p.x + DX[d] * a, y: p.y + DY[d] * a };
-  };
+  // La position brute avance à vitesse constante avec l'horloge lissée ; les sauts (virage prédit,
+  // correction du serveur) sont absorbés par un décalage qui s'amortit en ~80 ms au lieu de secouer l'écran.
+  const decay = Math.exp(-dt / 80);
+  for (const p of players.values()) {
+    const d = f > 0 && p.id === me && predQ.length ? predQ[0].d : p.dir;
+    const rx = p.x + DX[d] * f, ry = p.y + DY[d] * f;
+    if (p.rx === undefined) { p.ox = p.oy = 0; }
+    else {
+      const ex = p.rx + DX[p.rd] * (T - p.rT) * p.rv, ey = p.ry + DY[p.rd] * (T - p.rT) * p.rv;
+      const jx = ex - rx, jy = ey - ry;
+      if (Math.abs(jx) + Math.abs(jy) > 3) { p.ox = p.oy = 0; }
+      else { p.ox = p.ox * decay + jx; p.oy = p.oy * decay + jy; }
+    }
+    // Bloquée (message en retard) : la position brute ne bouge plus, il ne faut pas l'extrapoler
+    p.rx = rx; p.ry = ry; p.rd = d; p.rT = T; p.rv = f > -1 && f < 2 ? 1 : 0;
+    p.hx = rx + p.ox; p.hy = ry + p.oy;
+  }
+  const pos = p => ({ x: p.hx, y: p.hy });
 
   // Caméra : suit le joueur, sinon le leader
   let target = players.get(me);
   if (!target) target = [...players.values()].sort((p, q) => q.area - p.area)[0];
-  if (target) { const t = pos(target); cam.x += (t.x + 0.5 - cam.x) * 0.25; cam.y += (t.y + 0.5 - cam.y) * 0.25; }
+  if (target && target.id === me) { cam.x = target.hx + 0.5; cam.y = target.hy + 0.5; }
+  else if (target) { const k = 1 - Math.exp(-dt / 120); cam.x += (target.hx + 0.5 - cam.x) * k; cam.y += (target.hy + 0.5 - cam.y) * k; }
   const ox = vw / 2 - cam.x * cs, oy = vh / 2 - cam.y * cs;
 
   // Fond hors carte + carte
