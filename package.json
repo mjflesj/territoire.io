@@ -1,0 +1,17 @@
+{
+  "name": "territoire-io",
+  "version": "1.0.0",
+  "description": "Jeu de territoire multijoueur en ligne style paper.io",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

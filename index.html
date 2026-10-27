@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Territoire.io</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe6ee;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; user-select: none; touch-action: none; }
+  canvas { display: block; }
+  .panel { position: fixed; background: rgba(255,255,255,.85); border-radius: 10px; padding: 8px 12px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.12); font-size: 14px; color: #2d3436; }
+  #board { top: 12px; right: 12px; min-width: 190px; }
+  #board h3 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: #636e72; }
+  #board .row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+  #board .row.me { font-weight: 700; }
+  #board .dot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  #board .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px; }
+  #stats { left: 12px; bottom: 12px; font-size: 16px; font-weight: 600; display: none; }
+  #feed { position: fixed; top: 12px; left: 12px; font-size: 14px; }
+  #feed div { background: rgba(0,0,0,.55); color: #fff; padding: 4px 10px; border-radius: 6px; margin-bottom: 4px;
+    animation: fade 4s forwards; }
+  @keyframes fade { 0%, 75% { opacity: 1 } 100% { opacity: 0 } }
+  #mini { position: fixed; right: 12px; bottom: 12px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.2);
+    background: #fff; }
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(30,39,46,.35); backdrop-filter: blur(2px); }
+  .card { background: #fff; border-radius: 16px; padding: 28px 28px 24px; width: min(360px, calc(100% - 32px));
+    text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
+  .card h1 { margin: 0 0 4px; font-size: 34px; letter-spacing: -.02em; }
+  .card h1 span { color: #0984e3; }
+  .card p { color: #636e72; margin: 6px 0 18px; }
+  .card input { width: 100%; font-size: 18px; padding: 12px 14px; border: 2px solid #dfe6e9; border-radius: 10px;
+    outline: none; text-align: center; }
+  .card input:focus { border-color: #0984e3; }
+  .card button { margin-top: 12px; width: 100%; font-size: 20px; font-weight: 700; padding: 12px; border: 0;
+    border-radius: 10px; background: #00b894; color: #fff; cursor: pointer; box-shadow: 0 4px 0 #00896d; }
+  .card button:active { transform: translateY(2px); box-shadow: 0 2px 0 #00896d; }
+  .card .help { font-size: 13px; color: #95a5a6; margin: 14px 0 0; }
+  .big { font-size: 40px; font-weight: 800; color: #2d3436; margin: 8px 0 0; }
+  .hidden { display: none !important; }
+  #status { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+  @media (max-width: 600px) {
+    #board { min-width: 140px; font-size: 12px; padding: 6px 8px; }
+    #board .name { max-width: 80px; }
+    #board .row:nth-child(n+6):not(.me) { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<canvas id="mini" width="120" height="120"></canvas>
+<div id="board" class="panel"><h3>Classement</h3><div id="rows"></div></div>
+<div id="stats" class="panel"></div>
+<div id="feed"></div>
+
+<div id="menu" class="overlay">
+  <div class="card">
+    <h1>Territoire<span>.io</span></h1>
+    <p>Conquiers la carte. Ferme tes boucles. Coupe les traînées adverses.</p>
+    <input id="name" maxlength="16" placeholder="Ton pseudo" autocomplete="off">
+    <button id="play">Jouer</button>
+    <p class="help">Flèches / ZQSD / WASD pour tourner — glisser sur mobile</p>
+  </div>
+</div>
+<div id="death" class="overlay hidden">
+  <div class="card">
+    <h1 id="deathTitle">Éliminé !</h1>
+    <div class="big" id="deathScore">0 %</div>
+    <p id="deathInfo"></p>
+    <button id="again">Rejouer</button>
+  </div>
+</div>
+<div id="status" class="panel hidden">Connexion…</div>
+
+<script>
+const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+const cvs = document.getElementById('game'), ctx = cvs.getContext('2d');
+const mini = document.getElementById('mini'), mctx = mini.getContext('2d');
+let W = 0, H = 0, TICK = 110, grid = null, players = new Map(), me = null, ws = null;
+let lastTick = performance.now(), miniDirty = true, cam = { x: 0, y: 0 }, cs = 24;
+
+function shade(hex, f) {
+  const n = parseInt(hex.slice(1), 16);
+  const ch = s => { let v = (n >> s) & 255; v = f < 0 ? v * (1 + f) : v + (255 - v) * f; return Math.round(v); };
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+}
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
+}
+function addPlayer(id, name, color) {
+  if (players.has(id)) return players.get(id);
+  const p = { id, name, color: color || '#888', dark: shade(color || '#888', -0.28), light: shade(color || '#888', 0.25), trailCol: rgba(color || '#888', 0.55),
+    x: 0, y: 0, px: 0, py: 0, dir: 0, trail: [], area: 0, kills: 0, fresh: true };
+  players.set(id, p);
+  return p;
+}
+function removePlayer(id) {
+  for (let i = 0; i < grid.length; i++) if (grid[i] === id) grid[i] = 0;
+  players.delete(id);
+  miniDirty = true;
+}
+function applyState(p, s) {
+  const [, x, y, dir, tl, area, kills] = s;
+  if (p.fresh) { p.px = x; p.py = y; p.fresh = false; } else { p.px = p.x; p.py = p.y; }
+  p.x = x; p.y = y; p.dir = dir; p.area = area; p.kills = kills;
+  if (tl === 0) p.trail = [];
+  else if (tl > p.trail.length) p.trail.push(y * W + x);
+}
+
+// --- Réseau ---
+function connect() {
+  status('Connexion…');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onmessage = ev => handle(JSON.parse(ev.data));
+  ws.onopen = () => status(null);
+  ws.onclose = () => {
+    status('Connexion perdue, reconnexion…');
+    me = null; showDeath(false); show('menu', true);
+    setTimeout(connect, 1500);
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function handle(m) {
+  if (m.t === 'init') {
+    W = m.w; H = m.h; TICK = m.tick; grid = new Int32Array(W * H); players = new Map();
+    let i = 0;
+    for (let k = 0; k < m.grid.length; k += 2) { grid.fill(m.grid[k], i, i + m.grid[k + 1]); i += m.grid[k + 1]; }
+    for (const pd of m.players) { const p = addPlayer(pd.id, pd.name, pd.color); applyState(p, pd.s); p.trail = pd.trail.slice(); }
+    mini.width = W; mini.height = H; miniDirty = true;
+    cam.x = W / 2; cam.y = H / 2;
+  } else if (m.t === 's') {
+    if (!grid) return;
+    for (const e of m.e) {
+      if (e.k === 'n') addPlayer(e.id, e.name, e.color);
+      else if (e.k === 'd') {
+        const p = players.get(e.id);
+        if (p && e.by) feed(`${e.by} a éliminé ${p.name}`);
+        removePlayer(e.id);
+      }
+    }
+    for (let k = 0; k < m.c.length; k += 3) grid.fill(m.c[k + 2], m.c[k], m.c[k] + m.c[k + 1]);
+    if (m.c.length) miniDirty = true;
+    const seen = new Set();
+    for (const s of m.p) {
+      seen.add(s[0]);
+      applyState(players.get(s[0]) || addPlayer(s[0], '?', '#888'), s);
+    }
+    for (const id of [...players.keys()]) if (!seen.has(id)) players.delete(id);
+    lastTick = performance.now();
+    updateBoard();
+  } else if (m.t === 'you') {
+    me = m.id;
+  } else if (m.t === 'dead') {
+    me = null;
+    document.getElementById('deathTitle').textContent = m.by ? 'Éliminé !' : 'Perdu !';
+    document.getElementById('deathScore').textContent = m.score.toFixed(2) + ' %';
+    document.getElementById('deathInfo').textContent =
+      (m.by ? `Tué par ${m.by}` : 'Tu t\'es éliminé tout seul') + ` · ${m.kills} élimination${m.kills > 1 ? 's' : ''}`;
+    setTimeout(() => showDeath(true), 600);
+  }
+}
+
+// --- Interface ---
+const show = (id, on) => document.getElementById(id).classList.toggle('hidden', !on);
+function showDeath(on) { show('death', on); if (on) document.getElementById('again').focus(); }
+function status(t) { const s = document.getElementById('status'); s.textContent = t || ''; s.classList.toggle('hidden', !t); }
+function feed(t) {
+  const d = document.createElement('div'); d.textContent = t;
+  const f = document.getElementById('feed'); f.prepend(d);
+  setTimeout(() => d.remove(), 4000);
+  while (f.children.length > 5) f.lastChild.remove();
+}
+function pct(a) { return (a * 100 / (W * H)).toFixed(2) + ' %'; }
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function updateBoard() {
+  const list = [...players.values()].sort((a, b) => b.area - a.area);
+  const rows = list.slice(0, 8).map((p, i) =>
+    `<div class="row ${p.id === me ? 'me' : ''}"><span>${i + 1}.</span><span class="dot" style="background:${p.color}"></span>` +
+    `<span class="name">${esc(p.name)}</span><span>${pct(p.area)}</span></div>`);
+  const mine = players.get(me);
+  if (mine && list.indexOf(mine) >= 8) rows.push(`<div class="row me"><span>${list.indexOf(mine) + 1}.</span>` +
+    `<span class="dot" style="background:${mine.color}"></span><span class="name">${esc(mine.name)}</span><span>${pct(mine.area)}</span></div>`);
+  document.getElementById('rows').innerHTML = rows.join('');
+  const st = document.getElementById('stats');
+  st.style.display = mine ? 'block' : 'none';
+  if (mine) st.textContent = `${pct(mine.area)} · ${mine.kills} élim.`;
+}
+function start() {
+  const name = document.getElementById('name').value.trim();
+  try { localStorage.setItem('name', name); } catch {}
+  send({ t: 'join', name });
+  show('menu', false); showDeath(false);
+}
+document.getElementById('play').onclick = start;
+document.getElementById('again').onclick = start;
+document.getElementById('name').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+try { document.getElementById('name').value = localStorage.getItem('name') || ''; } catch {}
+
+// --- Contrôles ---
+const KEYS = { ArrowUp: 0, KeyW: 0, KeyZ: 0, ArrowRight: 1, KeyD: 1, ArrowDown: 2, KeyS: 2, ArrowLeft: 3, KeyA: 3, KeyQ: 3 };
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code in KEYS) { e.preventDefault(); if (me) send({ t: 'dir', d: KEYS[e.code] }); }
+  else if ((e.key === 'Enter' || e.key === ' ') && !me && !document.getElementById('death').classList.contains('hidden')) start();
+});
+let touch = null;
+addEventListener('touchstart', e => { const t = e.touches[0]; touch = { x: t.clientX, y: t.clientY }; }, { passive: true });
+addEventListener('touchmove', e => {
+  if (!touch || !me) return;
+  const t = e.touches[0], dx = t.clientX - touch.x, dy = t.clientY - touch.y;
+  if (Math.hypot(dx, dy) < 24) return;
+  send({ t: 'dir', d: Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 2 : 0) });
+  touch = { x: t.clientX, y: t.clientY };
+}, { passive: true });
+
+// --- Rendu ---
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  cvs.width = innerWidth * dpr; cvs.height = innerHeight * dpr;
+  cvs.style.width = innerWidth + 'px'; cvs.style.height = innerHeight + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cs = Math.max(14, Math.min(28, Math.min(innerWidth, innerHeight) / 26));
+  const ms = innerWidth < 600 ? 90 : 130;
+  mini.style.width = mini.style.height = ms + 'px';
+}
+addEventListener('resize', resize); resize();
+
+const miniBuf = document.createElement('canvas'), bctx = miniBuf.getContext('2d');
+function drawMini() {
+  if (miniBuf.width !== W) { miniBuf.width = W; miniBuf.height = H; }
+  const img = bctx.createImageData(W, H), d = img.data, cache = {};
+  for (let i = 0; i < grid.length; i++) {
+    const o = grid[i], k = i * 4;
+    if (!o) { d[k] = 236; d[k + 1] = 240; d[k + 2] = 244; d[k + 3] = 255; continue; }
+    let c = cache[o];
+    if (!c) { const p = players.get(o); const n = p ? parseInt(p.color.slice(1), 16) : 0x888888; c = cache[o] = [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+    d[k] = c[0]; d[k + 1] = c[1]; d[k + 2] = c[2]; d[k + 3] = 255;
+  }
+  bctx.putImageData(img, 0, 0);
+  miniDirty = false;
+}
+let lastMini = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!grid) return;
+  const a = Math.min(1, (now - lastTick) / TICK);
+  const vw = innerWidth, vh = innerHeight;
+  const pos = p => ({ x: p.px + (p.x - p.px) * a, y: p.py + (p.y - p.py) * a });
+
+  // Caméra : suit le joueur, sinon le leader
+  let target = players.get(me);
+  if (!target) target = [...players.values()].sort((p, q) => q.area - p.area)[0];
+  if (target) { const t = pos(target); cam.x += (t.x + 0.5 - cam.x) * 0.25; cam.y += (t.y + 0.5 - cam.y) * 0.25; }
+  const ox = vw / 2 - cam.x * cs, oy = vh / 2 - cam.y * cs;
+
+  // Fond hors carte + carte
+  ctx.fillStyle = '#c8d1db'; ctx.fillRect(0, 0, vw, vh);
+  ctx.fillStyle = '#eef2f6'; ctx.fillRect(ox, oy, W * cs, H * cs);
+  const x0 = Math.max(0, Math.floor(-ox / cs) - 1), x1 = Math.min(W - 1, Math.ceil((vw - ox) / cs) + 1);
+  const y0 = Math.max(0, Math.floor(-oy / cs) - 1), y1 = Math.min(H - 1, Math.ceil((vh - oy) / cs) + 1);
+  ctx.strokeStyle = 'rgba(0,0,0,.045)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = x0; x <= x1 + 1; x++) { ctx.moveTo(ox + x * cs, oy + y0 * cs); ctx.lineTo(ox + x * cs, oy + (y1 + 1) * cs); }
+  for (let y = y0; y <= y1 + 1; y++) { ctx.moveTo(ox + x0 * cs, oy + y * cs); ctx.lineTo(ox + (x1 + 1) * cs, oy + y * cs); }
+  ctx.stroke();
+
+  // Territoires (avec un léger relief)
+  const depth = Math.round(cs * 0.22);
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = y0; y <= y1; y++) {
+      let x = x0;
+      while (x <= x1) {
+        const o = grid[y * W + x];
+        let e = x + 1;
+        while (e <= x1 && grid[y * W + e] === o) e++;
+        if (o) {
+          const p = players.get(o);
+          if (p) {
+            ctx.fillStyle = pass ? p.color : p.dark;
+            ctx.fillRect(Math.floor(ox + x * cs), Math.floor(oy + y * cs + (pass ? 0 : depth)),
+              Math.ceil((e - x) * cs) + 1, Math.ceil(cs) + 1);
+          }
+        }
+        x = e;
+      }
+    }
+  }
+
+  // Traînées
+  ctx.lineCap = 'square'; ctx.lineJoin = 'miter';
+  for (const p of players.values()) {
+    if (!p.trail.length) continue;
+    const h = pos(p);
+    ctx.strokeStyle = p.trailCol; ctx.lineWidth = cs * 0.62; ctx.beginPath();
+    const f = p.trail[0];
+    const fx = f % W, fy = (f - fx) / W;
+    ctx.moveTo(ox + (fx + 0.5 - DX[p.trail.length === 1 ? p.dir : dirBetween(p.trail[0], p.trail[1])] * 0.5) * cs,
+               oy + (fy + 0.5 - DY[p.trail.length === 1 ? p.dir : dirBetween(p.trail[0], p.trail[1])] * 0.5) * cs);
+    for (let k = 0; k < p.trail.length - 1; k++) {
+      const c = p.trail[k], cx = c % W, cy = (c - cx) / W;
+      ctx.lineTo(ox + (cx + 0.5) * cs, oy + (cy + 0.5) * cs);
+    }
+    ctx.lineTo(ox + (h.x + 0.5) * cs, oy + (h.y + 0.5) * cs);
+    ctx.stroke();
+  }
+
+  // Têtes + noms
+  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  ctx.font = `600 ${Math.max(12, cs * 0.55)}px system-ui, sans-serif`;
+  for (const p of players.values()) {
+    const h = pos(p), x = ox + h.x * cs, y = oy + h.y * cs;
+    if (x < -cs * 4 || y < -cs * 4 || x > vw + cs * 4 || y > vh + cs * 4) continue;
+    const s = cs * 1.05, m = (cs - s) / 2;
+    ctx.fillStyle = p.dark; roundRect(x + m, y + m + depth, s, s, cs * 0.22); ctx.fill();
+    ctx.fillStyle = p.light; roundRect(x + m, y + m, s, s, cs * 0.22); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = p.dark; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; roundRect(x + m + s * 0.18, y + m + s * 0.15, s * 0.64, s * 0.22, s * 0.1); ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,.9)';
+    ctx.strokeText(p.name, x + cs / 2, y - cs * 0.2);
+    ctx.fillStyle = '#2d3436'; ctx.fillText(p.name, x + cs / 2, y - cs * 0.2);
+  }
+
+  // Minicarte
+  if (miniDirty && now - lastMini > 250) { drawMini(); lastMini = now; }
+  mctx.drawImage(miniBuf, 0, 0);
+  const mp = players.get(me);
+  if (mp) {
+    mctx.fillStyle = '#000'; mctx.fillRect(mp.x - 2, mp.y - 2, 5, 5);
+    mctx.fillStyle = '#fff'; mctx.fillRect(mp.x - 1, mp.y - 1, 3, 3);
+  }
+}
+function dirBetween(a, b) {
+  const d = b - a;
+  return d === -W ? 0 : d === 1 ? 1 : d === W ? 2 : 3;
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
